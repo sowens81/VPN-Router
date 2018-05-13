@@ -1,0 +1,535 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# fastIPvanish - a shell script to find the most responsive IPVanish VPN server
+#
+# Copyright (C) 2016, Chris Marsh <https://github.com/chris-marsh/fastIPvanish>
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU General Public License at
+# <http://www.gnu.org/licenses/> for more details.
+#
+# Requirements: sed, awk, grep, ping, curl & openvpn
+#
+# -----------------------------------------------------------------------------
+usage() {
+    echo 'USAGE'
+    echo '    fastIPvanish [-u] [-o] [-f] [-h] [-v]'
+    echo '                 [ [-l] [-s] [-w] [-c file] [-t file] filter ]'
+    echo
+    echo 'DESCRIPTION'
+    echo '    fastIPvanish will ping the servers of IPVanish, returning times'
+    echo '    and showing  the fastest responding server. Optionally, a config'
+    echo '    file can be written to file and used to start an openvpn session.'
+    echo
+    echo 'OPTIONS'
+    echo '    -u, --update-servers  - update the server list from IP Vanish'
+    echo '    -o, --start-openvpn   - start/restart openvpn with a config file'
+    echo '    -f, --force-defaults  - non-interactive mode without prompts'
+    echo '    -l, --list-pings      - list the ping result from each server'
+    echo '    -s, --show-config     - output an openvpn config file to screen'
+    echo '    -w, --write-config    - write an openvpn config to file'
+    echo '    -c, --config-file     - specify an output config file'
+    echo '    -t, --template-file   - specify an input template file'
+    echo '    -h, --help            - display this help'
+    echo '    -v, --version         - output version information'
+    echo
+    echo 'EXAMPLES'
+    echo '    fastIPvanish -wo -s London'
+    echo '    fastIPvanish -s US'
+    echo '    fastIPvanish -wo New-York'
+    echo '    fastIPvanish -w Amsterdam'
+    exit ${1:-0}
+}
+
+# -----------------------------------------------------------------------------
+version() {
+    echo 'Copyright (C) 2016 Chris Marsh.'
+    echo 'License GPLv3+: GNU GPL version 3 or later '\
+        '<http://gnu.org/licenses/gpl.html>.'
+    echo 'This is free software: you are free to change and redistribute it.'
+    echo 'There is NO WARRANTY, to the extent permitted by law.'
+    exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Helper function, writes error message to stderr and exits. Accepts two
+# optional arguments for (1) Description and (2) Error code
+error_exit()
+{
+    warning "$1"
+    exit ${2:-1}
+}
+
+# -----------------------------------------------------------------------------
+warning()
+{
+    echo -e "$(basename $0): ${1:-"Unknown Error"}" 1>&2
+}
+
+# -----------------------------------------------------------------------------
+# Helper function, show a yes/no question and loop until given a valid response
+# usage: ask "question" [default]
+ask() {
+    while true; do
+        read -p "$1 [Y/n] " response
+        case $response in
+            [Yy]* ) return 0 ;;
+            [Nn]* ) return 1 ;;
+            "" )
+                if [ "$2" = "Y" ] ; then
+                    return 0
+                elif [ "$2" = "N" ] ; then
+                    return 1
+                fi ;;
+        esac
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Helper function, return the qualified path of this script
+# usage: thePath=$(script_path)
+script_path() {
+    echo $(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+}
+
+# -----------------------------------------------------------------------------
+command_exists() {
+    if command -v $1 >/dev/null 2>&1; then
+        # command found
+        return 0
+    else
+        # command not available
+        return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Create a filename for using as a temporary file
+# Base dir preference is;
+#   1 ... ~/tmp
+#   2 ... /tmp
+#   3 ... ./[script_dir]
+# filename has the form script name.pid_no.radnom_no.tmp
+make_temp() {
+    local temp_dir=""
+    if [ -d "$HOME/tmp" ]; then
+        temp_dir="$HOME/tmp"
+    elif [ -d "/tmp" ]; then
+        temp_dir="/tmp"
+    else
+        temp_dir=$(script_path)
+    fi
+    echo "$temp_dir/$(basename $0).$$.$RANDOM.tmp"
+}
+
+# -----------------------------------------------------------------------------
+cleanup_temp() {
+    if [ -f "$temp_file" ]; then
+        rm -f "$temp_file"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Write an openvpn config file using a template
+# Global variables are read here;
+#   $best_server_url
+#   $opt_template_file
+write_config() {
+    local login_conf=$(script_path)'/etc/login.conf'
+    local cert_file=$(script_path)'/etc/ca.ipvanish.com.crt'
+
+    if [ "$OS" = "Windows_NT" ] && command_exists "cygpath"; then
+        login_conf=$(cygpath -m "$login_conf")
+        cert_file=$(cygpath -m "$cert_file")
+    fi
+    sed -e "s|SERVER_HERE|$best_server_url|g" \
+        -e "s|LOGIN_HERE|$login_conf|g" \
+        -e "s|CERT_HERE|$cert_file|g" "$opt_template_file"
+}
+
+# -----------------------------------------------------------------------------
+# Create log directory if it doesn't exist.
+# Keep last 3 log files plus the current.
+prepare_openvpn_logfile() {
+    mkdir -p $(script_path)'/log'
+
+    if [ -f $openvpn_logfile'.2' ]; then
+        mv -f $openvpn_logfile'.2' $openvpn_logfile'.3'
+    fi
+    if [ -f $openvpn_logfile'.1' ]; then
+        mv -f $openvpn_logfile'.1' $openvpn_logfile'.2'
+    fi
+    if [ -f $openvpn_logfile ]; then
+        mv -f $openvpn_logfile $openvpn_logfile'.1'
+    fi
+
+    # openvpn will be executed by root, therefore the logs will normally be
+    # owned by root. As the script may be executed with sudo, we want the log
+    # files to retain the same owner:group of the script.
+
+    # stat version does not work on openelec/busybox
+    # local owner=$(stat -c '%U' "$0")
+    # local group=$(stat -c '%G' "$0")
+
+    local owner=$(ls "$0" -l | awk '{print $3}')
+    local group=$(ls "$0" -l | awk '{print $4}')
+    touch "$openvpn_logfile"
+    chown -R $owner:$group "$(dirname "$openvpn_logfile")"
+}
+
+# -----------------------------------------------------------------------------
+# Takes an argument list and expand any group short arguments into seperate
+# options. 
+# Usage:  eval "set -- $(split_opts "$@")"
+#         eval "set -- $(split_opts "-lotr -file /some/file.txt)"
+# The first example passes the cli argument list which returns a split version.
+# The second example would return '-l' '-o' '-t' '-r' '-f' '/some/file.txt'
+split_opts() {
+    local args=""
+    for arg in "$@"; do
+        if [ "${#arg}" -gt 1 ] && [ "${arg:0:1}" = "-" ]; then
+            if [ "${arg:1:1}" = "-" ]; then
+                args="$args '$arg'";
+            else
+                for i in $(seq 1 ${#arg}); do
+                    opt=${arg:$i:1}
+                    if [ ${#opt} -gt 0 ]; then
+                        args="$args '-$opt'";
+                    fi
+                done;
+            fi
+        else
+            args="$args '$arg'";
+        fi
+    done
+    echo $args
+}
+
+# -----------------------------------------------------------------------------
+# Read the cli options & arguments and feed into global variables.
+# Also check options are valid before further unneccesary processing.
+parse_arguments() {
+    # Argument parsing
+    eval "set -- $(split_opts "$@")"
+    while [[ $1 ]]; do
+        case "$1" in
+            '-u'|'--update-servers')
+                opt_update_servers=true
+                ;;
+            '-l'|'--list-pings')
+                opt_list_pings=true
+                ;;
+            '-s'|'--show-config')
+                opt_config_to_output=true
+                ;;
+            '-w'|'--write-config')
+                opt_config_to_file=true
+                ;;
+            '-o'|'--start-openvpn')
+                opt_start_openvpn=true
+                ;;
+            '-c'|'--config-file')
+                opt_config_output_file=$2
+                shift
+                ;;
+            '-f'|'--force-defaults')
+                opt_force_defaults=true
+                shift
+                ;;
+            '-t'|'--template-file')
+                opt_template_file=$2
+                shift
+                ;;
+            '-h'|'--help')
+                usage
+                ;;
+            '-v'|'--version')
+                version
+                ;;
+            -*)
+                error_exit "Invalid option '$1'\nTry '--help' for more information."
+                ;;
+            *)
+                opt_filter=$1
+                ;;
+        esac
+        shift
+    done
+
+    # "Kill early" argument checks ....
+
+    # If starting openvpn ...
+    if [ "$opt_start_openvpn" = true ] ; then
+        # Do we have root privileges?
+        # NOTE: $EUID is not available on busybox/openelec
+        if [ "$(id -u)" != "0" ] ; then
+            error_exit 'Root privileges are required for -o to start/stop openvpn.'
+        fi
+        # Is openvpn installed?
+        if ! command_exists "openvpn" ; then
+            error_exit "openvpn does not appear to be installed?"
+        fi
+    fi
+
+    # Does the template file exist?
+    if [ -n "$opt_template_file" ]; then
+        find_template
+        if [ ! -f "$opt_template_file" ]; then
+            error_exit "Template does not exist! ... $opt_template_file"
+        fi
+    fi
+
+    # Are options being used that require a server match?
+    if [ "$opt_list_pings" = true ] ||
+        [ "$opt_config_to_output" = true ] ||
+        [ "$opt_config_to_file" = true ] && [ -z "$opt_filter" ]; then
+        warning "The option(s) used require a search filter."
+        error_exit "Try '--help' for more information."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Check if the template exists. If not ...
+# (1) check if the filename exists in the template directory
+# (2) check if it exists in the template directory WITh '.tmpl. extension
+find_template() {
+    if [ -f "$opt_template_file" ]; then
+        return 0
+    elif [ -f "$(script_path)/templates/$opt_template_file" ]; then
+        opt_template_file="$(script_path)/templates/$opt_template_file"
+        return 0
+    elif [ -f "$(script_path)/templates/$opt_template_file.tmpl" ]; then
+        opt_template_file="$(script_path)/templates/$opt_template_file.tmpl"
+        return 0
+    fi
+    return 1
+}
+
+# -----------------------------------------------------------------------------
+# Insert line break if argument is true
+line_break_if() {
+    if [ "$1" = true ] ; then
+        echo
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Grab the VPN server list directly from IP Vanish.
+# The html page returned is a file list. Fortunately the file list contains enough
+# info to identify a Geo location and a unique url. The VPN servers will be stored
+# in the form: CY-City-xyx.c01
+# where CY is a two letter country code, followed by a city. The following two
+# sections identify the server. eg, xyz.c01.ipvanish.com
+update_server_list() {
+    echo -n "Retrieving the server list from $ip_vanish_url ..."
+
+    cleanup_temp
+    if command_exists "curl"; then
+        curl "$ip_vanish_url" -o "$temp_file" 2>/dev/null
+    elif command_exists "wget"; then
+        wget "$ip_vanish_url" -O "$temp_file" 2>/dev/null
+    else
+        error_exit "Unable to download servers. 'curl' or 'wget' are required."
+    fi
+
+    if [ "$?" -ne 0 ]; then
+        echo
+        error_exit "Downloading from $ip_vanish_url has failed"
+    else
+        echo " Done";
+        if [ -f "$temp_file" ] ; then
+            echo -n "Writing new server list ..."
+            rm -rf "$vpn_server_list"
+            # Read and parse results from the temp file
+            while IFS='' read -r line || [[ -n "$line" ]] ; do
+                awk -F'"' '/ipvanish-/{print substr($6, 10, length($6)-14)}' $list \
+                    >> "$vpn_server_list"
+            done < "$temp_file"
+            echo " Done";
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Get the url and time of the server giving the lowest ping.
+# Results are given in the global variables;
+#    'best_server_url'
+#    'best_ping_time'
+ping_servers() {
+    local server_url=''
+    local ping_time=''
+
+    cleanup_temp
+    echo 'Starting server pings ... waiting ...'
+    while IFS='' read -r line || [[ -n "$line" ]] ; do
+        if ! [ "${line/$opt_filter}" = "$line" ] ; then
+            # Current line matches filter, build the url
+            server_url=$(echo $line | \
+                awk -F'-' '{print $(NF-1) "-" $NF ".ipvanish.com"}')
+            # Take: "rtt min/avg/max/mdev = 10.152/10.347/10.521/0.137 ms"
+            # Give: "some.server.com=10.347"
+            if [ "$OS" = "Windows_NT" ] ; then
+                echo $server_url'=' \
+                    $(ping -n 1 -l 16 -w 1000 $server_url 2> /dev/null | \
+                    awk -F'=' '/Average/{print $4}') \
+                    >> $temp_file &
+            else
+                echo $server_url'=' \
+                    $(ping -c 1 -q -s 16 -w 1 -W 1 $server_url 2> /dev/null | \
+                    awk -F'/' '/avg/{print $5}') \
+                    >> $temp_file &
+            fi
+        fi
+    done < "$vpn_server_list"
+    wait
+
+    line_break_if "$opt_list_pings"
+
+    if [ -f "$temp_file" ] ; then
+        # Read and parse results from the temp file
+        while IFS='' read -r line || [[ -n "$line" ]] ; do
+            server_url=$(echo $line | awk -F'=' '{print $1}')
+            time_str=$(echo $line | awk -F'=' '{print $2}')
+
+            # Remove all non-numeric characters, eg decimal point and 'ms'
+            ping_time=${time_str//[^0-9]/}
+
+            case $ping_time in                                                                           
+                ''|*[!0-9]*)                                                                    
+                    # ping_time is NOT a valid number
+                    if [ "$opt_list_pings" = true ] ; then 
+                        # Option '-l' is set ... list error result
+                        echo "$server_url : Error"
+                    fi
+                    ;;                                                         
+                *)
+                    # ping_time is a valid numeric.
+                    if [ "$opt_list_pings" = true ] ; then
+                        # Option '-l' is set ... list ping results
+                        echo "$server_url : $time_str"
+                    fi
+                    # If time is less than previous pings, store the url & time
+                    if [ "$ping_time" -lt "$best_ping_time" ] ; then                                   
+                        best_server_url=$server_url                                      
+                        best_ping_time=$ping_time                                                  
+                    fi ;;                                                                    
+            esac         
+        done < "$temp_file"
+        line_break_if  "$opt_list_pings"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+start_openvpn() {
+    # Check if openvpn is already running and stop it if neccesary
+    openvpn_pid=$(pidof openvpn)
+    if [ $openvpn_pid ] ; then
+        echo -n "Stopping existing openvpn process ..."
+        kill $openvpn_pid
+        while kill -0 "$openvpn_pid" 2> /dev/null; do
+            sleep 1
+            echo -n "."
+        done
+        echo " Done"
+    fi
+
+    # start openvpn as a background process with output going to a log file
+    echo -n "Starting openvpn ..."
+    prepare_openvpn_logfile
+    openvpn "$opt_config_output_file" >> "$openvpn_logfile" &
+
+    # Monitor openvpn's log file waiting for messages indicating success or failure
+    result=''
+    while [ ! $result ]; do
+        sleep 1; echo -n "."
+
+        if [ "$(grep "Initialization Sequence Completed" "$openvpn_logfile")" ]; then
+            result=' Success'
+        fi
+
+        if [ "$(grep -i "fail" "$openvpn_logfile")" ]; then
+            result='Failed'
+        fi
+    done
+    echo $result
+}
+
+# -----------------------------------------------------------------------------
+# Entry point to the main script
+main() {
+    parse_arguments "$@"
+
+    if [ ! -f "$vpn_server_list" ]; then
+        opt_update_servers=true
+    fi
+
+    if [ "$opt_update_servers" = true ]; then
+        update_server_list
+    fi
+
+    if [ -n "$opt_filter" ]; then
+        ping_servers
+        if [ "$best_server_url" = "" ] ; then
+            error_exit "No servers found matching: $opt_filter"
+        fi
+        best_ping_time=$(echo $best_ping_time | sed 's/...$/.&/')
+        echo "Best ping time was "$best_server_url" @ "$best_ping_time"ms"
+
+        if [ $opt_config_to_output = true ] ; then
+            # Send new config file to stdout
+            echo
+            write_config
+        fi
+    fi
+
+    if [ $opt_config_to_file = true ] ; then
+        # Create new openvpn config file from template and fastest server found
+        echo -e "\nSaving config file: "$opt_config_output_file
+        write_config > "$opt_config_output_file"
+    fi
+
+    if [ $opt_start_openvpn = true ] ; then
+            if [ -f "$opt_config_output_file" ]; then
+                start_openvpn
+            else
+                error_exit \
+                    "Openvpn config file does not exist. Use -w option to write."
+            fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Initialize variables and start the script
+
+if [[ $1 ]]; then
+    # Initialize the option variables
+    opt_update_servers=false
+    opt_force_defaults=false
+    opt_filter=''
+    opt_list_pings=false
+    opt_template_file=$(script_path)'/templates/default.tmpl'
+    opt_config_output_file=$(script_path)'/config.ovpn'
+    opt_config_to_file=false
+    opt_config_to_output=false
+    opt_start_openvpn=false
+
+    # Initialize global variables
+    best_ping_time="999999"
+    best_server_url=""
+    openvpn_logfile=$(script_path)'/log/openvpn.log'
+    vpn_server_list=$(script_path)'/etc/servers.list'
+    ip_vanish_url="http://www.ipvanish.com/software/configs/"
+
+    temp_file=$(make_temp)
+    trap cleanup_temp EXIT INT TERM HUP
+    trap 'exit 0' INT
+    main "$@"
+else
+    # At least one argument is required
+    usage 1
+fi
